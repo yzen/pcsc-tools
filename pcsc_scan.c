@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <string.h>
+#include <assert.h>
 
 #ifdef __APPLE__
 #include <PCSC/wintypes.h>
@@ -38,6 +39,7 @@
 #endif
 
 #define TIMEOUT 1000	/* 1 second timeout */
+#define RCVBUF_SIZE 500  /* KASPER */
 
 /* command used to parse (on screen) the ATR */
 #define ATR_PARSER "ATR_analysis"
@@ -50,12 +52,12 @@ int num_gpii_tokens = 3;
 char *gpii_atrs[] = {
   "3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 01 00 00 00 00 6A",
   "3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 26 00 00 00 00 4D",
-  "3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 03 00 00 00 00 68"
+  "3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 03 00 00 00 00 68",
 };
 char *gpii_tokens[] = {
-  "intergalacticSheepherder",
+  "kasper",
   "alanMathisonTuring",
-  "donaldKnuth"
+  "donaldKnuth",
 };
 
 
@@ -101,6 +103,15 @@ int main(int argc, char *argv[])
 	int pnp = TRUE;
         int logged_in = FALSE;
         time_t logged_in_time;
+
+    /*KASPER */
+    SCARDHANDLE hCard;
+    unsigned long dwActiveProtocol;
+    long authSendLength, dwSendLength, pcbRecvLength = RCVBUF_SIZE;
+
+    unsigned char pbRecvBuffer[RCVBUF_SIZE];
+    bzero(pbRecvBuffer, RCVBUF_SIZE); 
+    /* KASPER END */
 
 	printf("PC/SC device scanner\n");
 	printf("V " VERSION " (c) 2001-2011, Ludovic Rousseau <ludovic.rousseau@free.fr>\n");
@@ -410,7 +421,86 @@ get_readers:
                                 }
                               printf("Card inserted.  "); 
                               printf("%s%s%s\n", magenta, atr, color_end);
+                              printf("Reader %d: %s%s%s\n", current_reader, magenta, rgReaderStates_t[current_reader].szReader, color_end);
+                              /* KASPER START */
+                              rv = SCardConnect(hContext, rgReaderStates_t[current_reader].szReader, SCARD_SHARE_EXCLUSIVE,
+        SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &hCard, &dwActiveProtocol);
+                           
+                            //set up IO Requests
+                            SCARD_IO_REQUEST pioRecvPci;
+                            SCARD_IO_REQUEST pioSendPci;
+                            pioRecvPci.dwProtocol = dwActiveProtocol;
+                            pioRecvPci.cbPciLength = sizeof(long)*2;
+                            pioSendPci.dwProtocol = dwActiveProtocol;  
+                            pioSendPci.cbPciLength = sizeof(long)*2;
+                           
+                            printf("dwActiveProtocol: %d\n", dwActiveProtocol);
+
+                            assert(rv == SCARD_S_SUCCESS);
+                                //for this part, see: http://acs.com.hk/drivers/eng/API_ACR122U.pdf, section 5.2 and on
+                                //basically what needs to happen is that we need to authenticate first, then load data
+                                //if not authenticated, the attempt to get data (second call to SCardTransmit below),
+                                //will fail with a code 63
+
+                                //If successfull, the data should start around block 3 (value 0xD1), and the data a few bloks later
                                 
+                                //Authentication:
+                                char authBuffer[] = {0xFF, 0x86, 0x00, 0x00, 0x05, 0x01, 0x00, 0x04, 0x61, 0x00};
+                                authSendLength = 10;
+                                //char authBuffer[] = {0xFF, 0x88, 0x00, 0x04, 0x61, 0x00};
+                                //authSendLength = 6;
+
+                                memset(pbRecvBuffer, 0, RCVBUF_SIZE);
+                                                               
+                                rv = SCardTransmit(hCard,
+                                    &pioSendPci, authBuffer, authSendLength,
+                                    &pioRecvPci, pbRecvBuffer, &pcbRecvLength
+                                );
+
+                                
+                                printf("Received from authentication: %d \n", rv);
+                                for (i = 0; i < pcbRecvLength; i++) {
+                                    printf("[%d]: '%x'", i, pbRecvBuffer[i]);
+                                }
+                                assert(rv == SCARD_S_SUCCESS);
+                                
+                                //Read data
+                                char pbSendBuffer[] = {0x00, 0xB0, 0x00, 0x04, 0x10};
+                                //char pbSendBuffer[] = {0xFF, 0xCA, 0x01, 0x00, 0x00};
+                                dwSendLength = 5;
+                                pcbRecvLength = 18;
+                                    
+                                memset(pbRecvBuffer, 0, RCVBUF_SIZE);
+                                rv = SCardTransmit(hCard,
+                                    &pioSendPci, pbSendBuffer, dwSendLength,
+                                    NULL, pbRecvBuffer, &pcbRecvLength
+                                );
+
+                                printf("rv transmit data call return: %lx (%s)\n", rv, pcsc_stringify_error(rv));
+                                assert(rv == SCARD_S_SUCCESS);
+
+                                //if you manage to read a length of more than two, we're on our way
+                                printf("rcvbuf length: %ld\n", pcbRecvLength);
+                                for (i = 0; i < pcbRecvLength; i++) {
+                                    unsigned char c;
+                                    unsigned char s[5];
+                                    printf("[%d]: '%x'", i, pbRecvBuffer[i]);
+                                    //below is bogus code taken from an example on the web.. We'll probably want to read the data differently
+                                    if (pbRecvBuffer[i] == 31) {
+                                        sprintf(s, "^");
+                                    } else if (pbRecvBuffer[i] >= 32 && pbRecvBuffer[i] < 128) {
+                                        sprintf(s, "%c", pbRecvBuffer[i]);
+                                    } else {
+                                        sprintf(s, "<%02x>", pbRecvBuffer[i]);
+                                        printf("[%d]: '%c'", i, pbRecvBuffer[i]);
+                                    }
+
+                                    fprintf(stderr, "%s ", s);
+                                }
+                                fprintf(stderr, "\n");
+    
+    SCardDisconnect(hCard, SCARD_UNPOWER_CARD);
+                                /* KASPER END */
                               int count = 0;
                               int comp = 1;
                               for (count = 0; count < num_gpii_tokens; count++ ) {
